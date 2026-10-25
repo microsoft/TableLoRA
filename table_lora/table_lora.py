@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from imp import reload
+from importlib import reload
 import inspect
 from typing import Any, List, Optional, Union
 import warnings
@@ -13,7 +13,8 @@ from peft.config import PeftConfig
 from peft.utils.other import _get_batch_size
 from peft.utils.peft_types import PeftType
 from peft.peft_model import PEFT_TYPE_TO_MODEL_MAPPING
-from peft.utils import _prepare_prompt_learning_config, set_peft_model_state_dict, infer_device, load_peft_weights
+from peft.utils import _prepare_prompt_learning_config, set_peft_model_state_dict, infer_device
+from .adapter_security import adapter_selection, load_selection, load_safe_weights, require_safe_options
 from enum import Enum
 import torch
 import transformers
@@ -180,6 +181,10 @@ class PeftModel_new(PushToHubMixin, torch.nn.Module):
     #         return self._peft_config
     #     return self.base_model.peft_config
     def peft_config_getter(self) -> dict[str, PeftConfig]:
+        if self._is_adapter and not self._is_prompt_learning:
+            return self.base_model.peft_config
+        if self._is_prompt_learning and not self._is_adapter:
+            return self._peft_config
         peft_config = {}
         if self._is_prompt_learning:
             peft_config.update(self._peft_config)
@@ -266,33 +271,33 @@ class PeftModel_new(PushToHubMixin, torch.nn.Module):
         """
         from peft.mapping import MODEL_TYPE_TO_PEFT_MODEL_MAPPING, PEFT_TYPE_TO_CONFIG_MAPPING
 
-        entries = os.listdir(model_id) 
-        folders = ["."]
-        folders.extend([entry for entry in entries if os.path.isdir(os.path.join(model_id, entry))])
+        require_safe_options(kwargs)
+        selection = adapter_selection(adapter_name, kwargs.pop("subfolder", None), kwargs.pop("adapter_subfolders", None))
+        if config is not None and len(selection) != 1:
+            raise ValueError("A supplied config requires a single explicitly selected adapter")
         configs = []
-        adapter_names = []
-        for folder in folders:
+        adapter_names = list(selection)
+        for selected_name, folder in selection.items():
             kwargs["subfolder"] = folder
             # load the config
             if config is None:
-                try:
-                    config = PEFT_TYPE_TO_CONFIG_MAPPING[
-                        PeftConfig._get_peft_type(
-                            model_id,
-                            subfolder=kwargs.get("subfolder", None),
-                            revision=kwargs.get("revision", None),
-                            cache_dir=kwargs.get("cache_dir", None),
-                            use_auth_token=kwargs.get("use_auth_token", None),
-                            token=kwargs.get("token", None),
-                        )
-                    ].from_pretrained(model_id, **kwargs)
-                except:
-                    continue
+                config = PEFT_TYPE_TO_CONFIG_MAPPING[
+                    PeftConfig._get_peft_type(
+                        model_id,
+                        subfolder=folder,
+                        revision=kwargs.get("revision", None),
+                        cache_dir=kwargs.get("cache_dir", None),
+                        use_auth_token=kwargs.get("use_auth_token", None),
+                        token=kwargs.get("token", None),
+                    )
+                ].from_pretrained(model_id, **kwargs)
             elif isinstance(config, PeftConfig):
                 config.inference_mode = not is_trainable
             else:
                 raise ValueError(f"The input config must be a PeftConfig, got {config.__class__}")
 
+            if isinstance(config, XLoraConfig) or isinstance(getattr(model, "base_model", None), XLoraModel):
+                raise ValueError("Nested X-LoRA adapter loading is not supported by the safe loader")
             # Runtime configuration, if supported
             if hasattr(config, "runtime_config"):
                 config.runtime_config.ephemeral_gpu_offload = ephemeral_gpu_offload
@@ -304,33 +309,8 @@ class PeftModel_new(PushToHubMixin, torch.nn.Module):
                 raise ValueError("Cannot set a prompt learning adapter to trainable when loading pretrained adapter.")
             else:
                 config.inference_mode = not is_trainable
-            if isinstance(getattr(model, "base_model", None), XLoraModel):
-                if not isinstance(config, XLoraConfig):
-                    raise TypeError(f"Expected 'XLoraConfig', got '{type(config)}' instead.")
-                if "adapters" in kwargs:
-                    config.adapters = kwargs["adapters"]
-                else:
-                    # If the path is on HF hub, then we get the adapter names to create a subfolders list which tells
-                    # `load_adapter` where the adapters are.
-                    if not os.path.exists(model_id):
-                        s = HfFileSystem()
-
-                        # The names of the adapters which must be in folders
-                        adapter_names = [
-                            file["name"][len(model_id) + 1 :] for file in s.ls(model_id) if file["type"] == "directory"
-                        ]
-                        # Prepare a dict of adapter paths, which really just point to the hf id; we will use the subfolders
-                        adapter_paths = {}
-                        for adapter_name in adapter_names:
-                            adapter_paths[adapter_name] = os.path.join(model_id, model_id)
-                        config.adapters = adapter_paths
-                        config._subfolders = adapter_names
-                    else:
-                        if "adapters" not in kwargs:
-                            raise ValueError("If model_id is a local path, then `adapters` must be passed in kwargs.")
             configs.append(config)
             config = None
-            adapter_names.append(folder if folder != "." else "default")
         
 
         if hasattr(model, "hf_device_map"):
@@ -370,14 +350,16 @@ class PeftModel_new(PushToHubMixin, torch.nn.Module):
             remove_hook_from_submodules(model)
 
         if configs[0].task_type not in MODEL_TYPE_TO_PEFT_MODEL_MAPPING.keys():
-            model = cls(model, configs, adapter_name, autocast_adapter_dtype=autocast_adapter_dtype)
+            model = cls(model, configs[0], adapter_name, autocast_adapter_dtype=autocast_adapter_dtype)
         else:
             model = MODEL_TYPE_TO_PEFT_MODEL_MAPPING[configs[0].task_type](
-                model, configs, adapter_name, autocast_adapter_dtype=autocast_adapter_dtype
+                model, configs[0], adapter_name, autocast_adapter_dtype=autocast_adapter_dtype
             )
 
+        kwargs.pop("subfolder", None)
         model.load_adapter(
-            model_id, adapter_names, is_trainable=is_trainable, autocast_adapter_dtype=autocast_adapter_dtype, **kwargs
+            model_id, adapter_names, adapter_subfolders=selection,
+            is_trainable=is_trainable, autocast_adapter_dtype=autocast_adapter_dtype, **kwargs
         )
 
         return model
@@ -421,16 +403,18 @@ class PeftModel_new(PushToHubMixin, torch.nn.Module):
         """
         from peft.mapping import PEFT_TYPE_TO_CONFIG_MAPPING
 
+        require_safe_options(kwargs)
+        selection = load_selection(adapter_name, kwargs.pop("subfolder", None), kwargs.pop("adapter_subfolders", None))
+        adapter_name = list(selection)
+        if isinstance(getattr(self, "base_model", None), XLoraModel):
+            raise ValueError("Nested X-LoRA adapter loading is not supported by the safe loader")
         hf_hub_download_kwargs, kwargs = self._split_kwargs(kwargs)
         if torch_device is None:
             torch_device = infer_device()
 
-        if isinstance(adapter_name, str):
-            adapter_name = [adapter_name]
-        
         for name in adapter_name:
             if name not in self.peft_config:
-                hf_hub_download_kwargs["subfolder"] = name if name != "default" else None
+                hf_hub_download_kwargs["subfolder"] = selection[name]
                 # load the config
                 peft_config = PEFT_TYPE_TO_CONFIG_MAPPING[
                     PeftConfig._get_peft_type(
@@ -442,6 +426,8 @@ class PeftModel_new(PushToHubMixin, torch.nn.Module):
                     ephemeral_gpu_offload=ephemeral_gpu_offload,
                     **hf_hub_download_kwargs,
                 )
+                if isinstance(peft_config, XLoraConfig):
+                    raise ValueError("Nested X-LoRA adapter loading is not supported by the safe loader")
                 if peft_config.is_prompt_learning and is_trainable:
                     raise ValueError("Cannot set a prompt learning adapter to trainable when loading pretrained adapter.")
                 else:
@@ -449,8 +435,8 @@ class PeftModel_new(PushToHubMixin, torch.nn.Module):
                 self.add_adapter(name, peft_config)
 
         for name in adapter_name:
-            hf_hub_download_kwargs["subfolder"] = name if name != "default" else None
-            adapters_weights = load_peft_weights(model_id, device=torch_device, **hf_hub_download_kwargs)
+            hf_hub_download_kwargs.pop("subfolder", None)
+            adapters_weights = load_safe_weights(model_id, subfolder=selection[name], device=torch_device, **hf_hub_download_kwargs)
 
             # load the weights into the model
             ignore_mismatched_sizes = kwargs.get("ignore_mismatched_sizes", False)
@@ -1405,7 +1391,7 @@ def load_table_lora():
     PeftModel.peft_config = property(PeftModel_new.peft_config_getter, PeftModel_new.peft_config_setter)
     PeftModel.add_adapter = PeftModel_new.add_adapter
     PeftModel.get_base_model = PeftModel_new.get_base_model
-    PeftModel.from_pretrained = PeftModel_new.from_pretrained
+    PeftModel.from_pretrained = classmethod(PeftModel_new.from_pretrained.__func__)
     PeftModel.load_adapter = PeftModel_new.load_adapter
     PeftModelForCausalLM.forward = PeftModelForCausalLM_new.forward
     PeftModelForCausalLM.prepare_inputs_for_generation = PeftModelForCausalLM_new.prepare_inputs_for_generation
